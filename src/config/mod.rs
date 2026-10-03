@@ -943,6 +943,19 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                     state.common.update_config();
                 }
             }
+            "fullscreen_keeps_maximize" => {
+                // Unlike `get_config`, fall back to the default of `true` rather than `false`.
+                let new = config
+                    .get::<bool>("fullscreen_keeps_maximize")
+                    .unwrap_or_else(|err| {
+                        error!(?err, "Failed to read config 'fullscreen_keeps_maximize'");
+                        CosmicCompConfig::default().fullscreen_keeps_maximize
+                    });
+                if new != state.common.config.cosmic_conf.fullscreen_keeps_maximize {
+                    state.common.config.cosmic_conf.fullscreen_keeps_maximize = new;
+                    state.common.update_config();
+                }
+            }
             "active_hint" => {
                 let new = get_config::<bool>(&config, "active_hint");
                 if new != state.common.config.cosmic_conf.active_hint {

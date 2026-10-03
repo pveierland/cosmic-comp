@@ -93,6 +93,8 @@ pub struct CosmicCompConfig {
     pub autotile_behavior: TileBehavior,
     /// Where new windows are placed in the tiling layout
     pub tiling_placement: TilingPlacement,
+    /// Whether a maximized window that enters fullscreen is maximized again when it leaves
+    pub fullscreen_keeps_maximize: bool,
     /// Active hint enabled
     pub active_hint: bool,
     /// Enables changing keyboard focus to windows when the cursor passes into them
@@ -143,6 +145,7 @@ impl Default for CosmicCompConfig {
             autotile: Default::default(),
             autotile_behavior: Default::default(),
             tiling_placement: Default::default(),
+            fullscreen_keeps_maximize: true,
             active_hint: true,
             focus_follows_cursor: false,
             cursor_follows_focus: false,
