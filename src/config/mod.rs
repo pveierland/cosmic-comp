@@ -50,7 +50,8 @@ use cosmic::config::CosmicTk;
 pub use cosmic_comp_config::EdidProduct;
 use cosmic_comp_config::{
     ActivationPolicy, AppearanceConfig, CosmicCompConfig, CursorHideConfig, DecorationPreference,
-    KeyboardConfig, TileBehavior, XkbConfig, XwaylandDescaling, XwaylandEavesdropping, ZoomConfig,
+    KeyboardConfig, TileBehavior, TilingPlacement, XkbConfig, XwaylandDescaling,
+    XwaylandEavesdropping, ZoomConfig,
     input::{DeviceState as InputDeviceState, InputConfig, TouchpadOverride},
     output::comp::{
         OutputConfig, OutputInfo, OutputState, OutputsConfig, TransformDef, load_outputs,
@@ -933,6 +934,13 @@ fn config_changed(config: cosmic_config::Config, keys: Vec<String>, state: &mut 
                         &mut state.common.workspace_state.update(),
                         shell_ref.seats.iter(),
                     );
+                }
+            }
+            "tiling_placement" => {
+                let new = get_config::<TilingPlacement>(&config, "tiling_placement");
+                if new != state.common.config.cosmic_conf.tiling_placement {
+                    state.common.config.cosmic_conf.tiling_placement = new;
+                    state.common.update_config();
                 }
             }
             "active_hint" => {

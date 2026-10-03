@@ -91,6 +91,8 @@ pub struct CosmicCompConfig {
     /// If set to Global, autotile applies to all windows in all workspaces
     /// If set to PerWorkspace, autotile only applies to new windows, and new workspaces
     pub autotile_behavior: TileBehavior,
+    /// Where new windows are placed in the tiling layout
+    pub tiling_placement: TilingPlacement,
     /// Active hint enabled
     pub active_hint: bool,
     /// Enables changing keyboard focus to windows when the cursor passes into them
@@ -140,6 +142,7 @@ impl Default for CosmicCompConfig {
             keyboard_config: Default::default(),
             autotile: Default::default(),
             autotile_behavior: Default::default(),
+            tiling_placement: Default::default(),
             active_hint: true,
             focus_follows_cursor: false,
             cursor_follows_focus: false,
@@ -162,6 +165,33 @@ pub enum TileBehavior {
     #[default]
     Global,
     PerWorkspace,
+}
+
+/// Where the tiling layout places a new window.
+///
+/// This also decides how windows are arranged when tiling is enabled on a
+/// workspace that already has windows, as they are placed one at a time.
+/// Windows placed in a given direction, e.g. when moved in from another
+/// output, keep that direction.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum TilingPlacement {
+    /// Split the focused window in half along its longer side, so each new
+    /// window gets half the space of the previous one.
+    ///
+    /// Like the dwindle layouts of awesome and Hyprland, or the `longest_side`
+    /// scheme of bspwm.
+    #[default]
+    Dwindle,
+    /// Place the new window after the focused window, taking an even share of
+    /// their row or column.
+    ///
+    /// Like the split containers of i3 and sway.
+    Even,
+    /// Arrange windows in a grid of `ceil(sqrt(n))` columns (rows on portrait
+    /// outputs), adding each window to the column with the fewest windows.
+    ///
+    /// Like the fair layout of awesome. The focused window is not considered.
+    Grid,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
