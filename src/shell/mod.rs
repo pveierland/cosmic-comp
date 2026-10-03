@@ -26,7 +26,7 @@ use crate::{
     },
 };
 use cosmic_comp_config::{
-    AppearanceConfig, TileBehavior, ZoomConfig, ZoomMovement,
+    AppearanceConfig, TileBehavior, TilingPlacement, ZoomConfig, ZoomMovement,
     workspace::{PinnedWorkspace, WorkspaceLayout, WorkspaceMode},
 };
 use cosmic_config::ConfigSet;
@@ -304,6 +304,7 @@ pub struct Shell {
     resize_indicator: Option<ResizeIndicator>,
     zoom_state: Option<ZoomState>,
     appearance_conf: AppearanceConfig,
+    fullscreen_keeps_maximize: bool,
     tiling_exceptions: TilingExceptions,
 
     #[cfg(feature = "debug")]
@@ -375,6 +376,7 @@ pub struct WorkspaceSet {
     output: Output,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
+    tiling_placement: TilingPlacement,
     pub sticky_layer: FloatingLayout,
     pub minimized_windows: Vec<MinimizedWindow>,
     pub workspaces: Vec<Workspace>,
@@ -388,6 +390,7 @@ fn create_workspace(
     tiling: bool,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
+    tiling_placement: TilingPlacement,
 ) -> Workspace {
     let workspace_handle = state
         .create_workspace(
@@ -417,6 +420,7 @@ fn create_workspace(
         tiling,
         theme.clone(),
         appearance,
+        tiling_placement,
     )
 }
 
@@ -428,6 +432,7 @@ fn create_workspace_from_pinned(
     active: bool,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
+    tiling_placement: TilingPlacement,
 ) -> Workspace {
     let workspace_handle = state
         .create_workspace(
@@ -462,6 +467,7 @@ fn create_workspace_from_pinned(
         output.clone(),
         theme.clone(),
         appearance,
+        tiling_placement,
     )
 }
 
@@ -498,6 +504,7 @@ impl WorkspaceSet {
         tiling_enabled: bool,
         theme: &cosmic::Theme,
         appearance: AppearanceConfig,
+        tiling_placement: TilingPlacement,
     ) -> WorkspaceSet {
         let group_handle = state.create_workspace_group();
         let sticky_layer = FloatingLayout::new(theme.clone(), appearance, output);
@@ -513,6 +520,7 @@ impl WorkspaceSet {
             workspaces: Vec::new(),
             output: output.clone(),
             appearance,
+            tiling_placement,
         }
     }
 
@@ -638,6 +646,7 @@ impl WorkspaceSet {
             self.tiling_enabled,
             self.theme.clone(),
             self.appearance,
+            self.tiling_placement,
         );
         workspace_set_idx(
             state,
@@ -845,6 +854,7 @@ pub struct Workspaces {
     autotile_behavior: TileBehavior,
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
+    tiling_placement: TilingPlacement,
     // Persisted workspace to add on first `output_add`
     persisted_workspaces: Vec<PinnedWorkspace>,
 }
@@ -860,6 +870,7 @@ impl Workspaces {
             autotile_behavior: config.cosmic_conf.autotile_behavior,
             theme,
             appearance: config.cosmic_conf.appearance_settings,
+            tiling_placement: config.cosmic_conf.tiling_placement,
             persisted_workspaces: config.cosmic_conf.pinned_workspaces.clone(),
         }
     }
@@ -887,6 +898,7 @@ impl Workspaces {
                     self.autotile,
                     &self.theme,
                     self.appearance,
+                    self.tiling_placement,
                 )
             });
         workspace_state.add_group_output(&set.group, output);
@@ -901,6 +913,7 @@ impl Workspaces {
                 false,
                 self.theme.clone(),
                 self.appearance,
+                self.tiling_placement,
             );
             set.workspaces.push(workspace);
         }
@@ -1179,13 +1192,16 @@ impl Workspaces {
         self.mode = config.cosmic_conf.workspaces.workspace_mode;
         self.layout = config.cosmic_conf.workspaces.workspace_layout;
         self.appearance = config.cosmic_conf.appearance_settings;
+        self.tiling_placement = config.cosmic_conf.tiling_placement;
 
         for set in self.sets.values_mut() {
             set.appearance = self.appearance;
+            set.tiling_placement = self.tiling_placement;
             set.sticky_layer.appearance = self.appearance;
             for workspace in set.workspaces.iter_mut() {
                 workspace.floating_layer.appearance = self.appearance;
                 workspace.tiling_layer.appearance = self.appearance;
+                workspace.tiling_layer.placement = self.tiling_placement;
             }
         }
 
@@ -1235,6 +1251,7 @@ impl Workspaces {
                                     config.cosmic_conf.autotile,
                                     self.theme.clone(),
                                     self.appearance,
+                                    self.tiling_placement,
                                 ),
                             );
                         }
@@ -1590,6 +1607,7 @@ impl Common {
         let shell_ref = &mut *shell;
         shell_ref.active_hint = self.config.cosmic_conf.active_hint;
         shell_ref.appearance_conf = self.config.cosmic_conf.appearance_settings;
+        shell_ref.fullscreen_keeps_maximize = self.config.cosmic_conf.fullscreen_keeps_maximize;
         if let Some(zoom_state) = shell_ref.zoom_state.as_mut() {
             zoom_state.increment = self.config.cosmic_conf.accessibility_zoom.increment;
             zoom_state.movement = self.config.cosmic_conf.accessibility_zoom.view_moves;
@@ -1750,6 +1768,7 @@ impl Shell {
             resize_state: None,
             resize_indicator: None,
             appearance_conf: config.cosmic_conf.appearance_settings,
+            fullscreen_keeps_maximize: config.cosmic_conf.fullscreen_keeps_maximize,
             zoom_state: None,
             tiling_exceptions,
 
@@ -3823,7 +3842,9 @@ impl Shell {
                 .find(|f| &f.surface == surface)
                 .unwrap();
             element_geo = Some(workspace.fullscreen_geometry_for(fs));
-            let (surface, state, _) = workspace.remove_fullscreen_surface(surface).unwrap();
+            let (surface, state, _) = workspace
+                .remove_fullscreen_surface(surface, self.fullscreen_keeps_maximize)
+                .unwrap();
             self.remap_unfullscreened_window(surface, state, evlh);
         };
 
@@ -5035,8 +5056,9 @@ impl Shell {
         });
 
         if let Some(workspace) = maybe_workspace {
-            let (old_fullscreen, restore, _) =
-                workspace.remove_fullscreen_surface(surface).unwrap();
+            let (old_fullscreen, restore, _) = workspace
+                .remove_fullscreen_surface(surface, self.fullscreen_keeps_maximize)
+                .unwrap();
             toplevel_leave_output(&old_fullscreen, &workspace.output);
             toplevel_leave_workspace(&old_fullscreen, &workspace.handle);
 

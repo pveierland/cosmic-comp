@@ -21,8 +21,8 @@ use crate::{
         },
     },
 };
-use cosmic_comp_config::AppearanceConfig;
 use cosmic_comp_config::workspace::{OutputMatch, PinnedWorkspace};
+use cosmic_comp_config::{AppearanceConfig, TilingPlacement};
 
 use cosmic::theme::CosmicTheme;
 use cosmic_protocols::workspace::v2::server::zcosmic_workspace_handle_v2::TilingState;
@@ -279,6 +279,24 @@ impl FullscreenRestoreState {
         }
     }
 
+    /// Restore the window unmaximized, even if it was maximized before entering fullscreen.
+    ///
+    /// Returns the geometry it will be restored to, if that is known before it is remapped.
+    pub fn unmaximize(&mut self) -> Option<Rectangle<i32, Local>> {
+        match self {
+            FullscreenRestoreState::Floating { state, .. }
+            | FullscreenRestoreState::Sticky { state, .. } => {
+                state.was_maximized = false;
+                Some(state.geometry)
+            }
+            FullscreenRestoreState::Tiling { state, .. } => {
+                state.was_maximized = false;
+                None
+            }
+            FullscreenRestoreState::Stack { .. } => None,
+        }
+    }
+
     // Surface was previously a single-window stack
     pub fn was_stack(&self) -> bool {
         match self {
@@ -387,8 +405,9 @@ impl Workspace {
         tiling_enabled: bool,
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
+        tiling_placement: TilingPlacement,
     ) -> Workspace {
-        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output);
+        let tiling_layer = TilingLayout::new(theme.clone(), appearance, tiling_placement, &output);
         let floating_layer = FloatingLayout::new(theme, appearance, &output);
         let output_match = output_match_for_output(&output);
 
@@ -421,8 +440,9 @@ impl Workspace {
         output: Output,
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
+        tiling_placement: TilingPlacement,
     ) -> Self {
-        let tiling_layer = TilingLayout::new(theme.clone(), appearance, &output);
+        let tiling_layer = TilingLayout::new(theme.clone(), appearance, tiling_placement, &output);
         let floating_layer = FloatingLayout::new(theme, appearance, &output);
         let output_match = output_match_for_output(&output);
 
@@ -1362,6 +1382,7 @@ impl Workspace {
     pub fn remove_fullscreen_surface<S>(
         &mut self,
         surface: &S,
+        keep_maximize: bool,
     ) -> Option<(
         CosmicSurface,
         Option<FullscreenRestoreState>,
@@ -1374,6 +1395,19 @@ impl Workspace {
             .fullscreen_surfaces
             .iter()
             .position(|f| f.ended_at.is_none() && &f.surface == surface)?;
+        if !keep_maximize {
+            let fullscreen = &mut self.fullscreen_surfaces[idx];
+            if let Some(state) = fullscreen
+                .previous_state
+                .as_mut()
+                .filter(|state| state.was_maximized())
+            {
+                // Leaving fullscreen configures and animates the window towards its previous,
+                // maximized geometry. A tile's geometry is only known once it is remapped, so
+                // until then a tiled window keeps its fullscreen size instead.
+                fullscreen.previous_geometry = state.unmaximize();
+            }
+        }
         self.remove_fullscreen_at(idx)
     }
 

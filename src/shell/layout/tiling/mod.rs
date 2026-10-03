@@ -37,7 +37,7 @@ use crate::{
     },
 };
 
-use cosmic_comp_config::AppearanceConfig;
+use cosmic_comp_config::{AppearanceConfig, TilingPlacement};
 use cosmic_settings_config::shortcuts::action::{FocusDirection, ResizeDirection};
 use id_tree::{InsertBehavior, MoveBehavior, Node, NodeId, NodeIdError, RemoveBehavior, Tree};
 use keyframe::{
@@ -138,6 +138,7 @@ pub struct TilingLayout {
     last_overview_hover: Option<(Option<Instant>, TargetZone)>,
     pub theme: cosmic::Theme,
     pub appearance: AppearanceConfig,
+    pub placement: TilingPlacement,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -352,6 +353,7 @@ impl TilingLayout {
     pub fn new(
         theme: cosmic::Theme,
         appearance: AppearanceConfig,
+        placement: TilingPlacement,
         output: &Output,
     ) -> TilingLayout {
         TilingLayout {
@@ -369,6 +371,7 @@ impl TilingLayout {
             last_overview_hover: None,
             theme,
             appearance,
+            placement,
         }
     }
 
@@ -427,6 +430,7 @@ impl TilingLayout {
             &mut tree,
             window,
             &self.output,
+            self.placement,
             last_active,
             direction,
             minimize_rect,
@@ -549,6 +553,7 @@ impl TilingLayout {
         tree: &mut Tree<Data>,
         window: impl Into<CosmicMapped>,
         output: &Output,
+        placement: TilingPlacement,
         node: Option<NodeId>,
         direction: Option<Direction>,
         minimize_rect: Option<Rectangle<i32, Local>>,
@@ -581,6 +586,12 @@ impl TilingLayout {
             } else {
                 tree.insert(new_window, InsertBehavior::AsRoot).unwrap()
             }
+        } else if placement == TilingPlacement::Even {
+            let major = split_orientation(output.geometry().size);
+            TilingLayout::place_even(tree, new_window, node.as_ref(), major)
+        } else if placement == TilingPlacement::Grid {
+            let major = split_orientation(output.geometry().size);
+            TilingLayout::place_grid(tree, new_window, major)
         } else if let Some(ref node_id) = node {
             let orientation = {
                 let window_size = tree.get(node_id).unwrap().data().geometry().size;
@@ -706,6 +717,29 @@ impl TilingLayout {
 
                 let id = match other_tree.root_node_id() {
                     None => other_tree.insert(node, InsertBehavior::AsRoot).unwrap(),
+                    Some(_)
+                        if direction.is_none() && other.placement != TilingPlacement::Dwindle =>
+                    {
+                        let focused_node = seat
+                            .get_keyboard()
+                            .unwrap()
+                            .current_focus()
+                            .and_then(|target| {
+                                TilingLayout::currently_focused_node(&other_tree, target)
+                            })
+                            .map(|(id, _)| id);
+                        let major = split_orientation(other.output.geometry().size);
+                        if other.placement == TilingPlacement::Even {
+                            TilingLayout::place_even(
+                                &mut other_tree,
+                                node,
+                                focused_node.as_ref(),
+                                major,
+                            )
+                        } else {
+                            TilingLayout::place_grid(&mut other_tree, node, major)
+                        }
+                    }
                     Some(_) => {
                         let focused_node = seat
                             .get_keyboard()
@@ -2197,10 +2231,12 @@ impl TilingLayout {
                     window.set_bounds(layer_map.non_exclusive_zone().size);
                 }
 
+                // Always split the stack's tile, which is focused below as the group of its windows.
                 TilingLayout::map_to_tree(
                     &mut tree,
                     window.clone(),
                     &self.output,
+                    TilingPlacement::Dwindle,
                     Some(current_node),
                     None,
                     None,
@@ -2791,6 +2827,7 @@ impl TilingLayout {
                     &mut tree,
                     window.clone(),
                     &self.output,
+                    self.placement,
                     None,
                     None,
                     None,
@@ -2934,6 +2971,119 @@ impl TilingLayout {
             .unwrap();
 
         Ok(group_id)
+    }
+
+    /// Places `node` for [`TilingPlacement::Even`]: after `focused` in its group, or last in the
+    /// root group without a focused node. A lone window is split along `major`.
+    fn place_even(
+        tree: &mut Tree<Data>,
+        node: Node<Data>,
+        focused: Option<&NodeId>,
+        major: Orientation,
+    ) -> NodeId {
+        let Some(anchor_id) = focused.or(tree.root_node_id()).cloned() else {
+            return tree.insert(node, InsertBehavior::AsRoot).unwrap();
+        };
+
+        let anchor = tree.get(&anchor_id).unwrap();
+        if let Some(parent_id) = anchor.parent().cloned() {
+            let idx = tree
+                .children_ids(&parent_id)
+                .unwrap()
+                .position(|id| id == &anchor_id)
+                .unwrap();
+            TilingLayout::insert_into_group(tree, &parent_id, node, idx + 1)
+        } else if anchor.data().is_group() {
+            let idx = anchor.data().len();
+            TilingLayout::insert_into_group(tree, &anchor_id, node, idx)
+        } else {
+            TilingLayout::split_node(tree, &anchor_id, node, major)
+        }
+    }
+
+    /// Places `node` for [`TilingPlacement::Grid`]: in a new column while there are fewer than
+    /// [`grid_columns`], otherwise last in the column with the fewest tiles. Columns are split
+    /// along `major`, so they are rows on portrait outputs.
+    fn place_grid(tree: &mut Tree<Data>, node: Node<Data>, major: Orientation) -> NodeId {
+        let Some(root_id) = tree.root_node_id().cloned() else {
+            return tree.insert(node, InsertBehavior::AsRoot).unwrap();
+        };
+        let minor = match major {
+            Orientation::Horizontal => Orientation::Vertical,
+            Orientation::Vertical => Orientation::Horizontal,
+        };
+
+        // A root split any other way, e.g. after the user changed its orientation, is one column.
+        let root_is_columns = matches!(
+            tree.get(&root_id).unwrap().data(),
+            Data::Group { orientation, .. } if *orientation == major
+        );
+        let columns: Vec<NodeId> = if root_is_columns {
+            tree.children_ids(&root_id).unwrap().cloned().collect()
+        } else {
+            vec![root_id.clone()]
+        };
+
+        let tiles = TilingLayout::tile_count(tree, &root_id) + 1;
+        if columns.len() < grid_columns(tiles) {
+            if root_is_columns {
+                TilingLayout::insert_into_group(tree, &root_id, node, columns.len())
+            } else {
+                TilingLayout::split_node(tree, &root_id, node, major)
+            }
+        } else {
+            // On a tie the later column grows, so the first column keeps the fewest tiles.
+            let column_id = columns
+                .iter()
+                .rev()
+                .min_by_key(|id| TilingLayout::tile_count(tree, id))
+                .unwrap()
+                .clone();
+            match tree.get(&column_id).unwrap().data() {
+                Data::Group {
+                    orientation, sizes, ..
+                } if *orientation == minor => {
+                    let idx = sizes.len();
+                    TilingLayout::insert_into_group(tree, &column_id, node, idx)
+                }
+                _ => TilingLayout::split_node(tree, &column_id, node, minor),
+            }
+        }
+    }
+
+    /// Inserts `node` into the group at `group_id` at `idx`, taking an even share of its space.
+    fn insert_into_group(
+        tree: &mut Tree<Data>,
+        group_id: &NodeId,
+        node: Node<Data>,
+        idx: usize,
+    ) -> NodeId {
+        let new_id = tree
+            .insert(node, InsertBehavior::UnderNode(group_id))
+            .unwrap();
+        tree.get_mut(group_id).unwrap().data_mut().add_window(idx);
+        tree.make_nth_sibling(&new_id, idx).unwrap();
+        new_id
+    }
+
+    /// Splits the node at `node_id` in half with `node`, which goes second.
+    fn split_node(
+        tree: &mut Tree<Data>,
+        node_id: &NodeId,
+        node: Node<Data>,
+        orientation: Orientation,
+    ) -> NodeId {
+        let new_id = tree.insert(node, InsertBehavior::AsRoot).unwrap();
+        TilingLayout::new_group(tree, node_id, &new_id, orientation).unwrap();
+        new_id
+    }
+
+    /// The number of tiles under the node at `node_id`: windows, stacks and placeholders.
+    fn tile_count(tree: &Tree<Data>, node_id: &NodeId) -> usize {
+        tree.traverse_pre_order(node_id)
+            .unwrap()
+            .filter(|node| !node.data().is_group())
+            .count()
     }
 
     fn has_adjacent_node(tree: &Tree<Data>, node: &NodeId, direction: Direction) -> bool {
@@ -4334,6 +4484,21 @@ const WINDOW_BACKDROP_BORDER: i32 = 4;
 const WINDOW_BACKDROP_GAP: i32 = 12;
 
 const MAX_SWAP_WINDOW_SIZE: (i32, i32) = (360, 240);
+
+/// The orientation that splits an area of `size` along its longer side.
+fn split_orientation<Kind>(size: Size<i32, Kind>) -> Orientation {
+    if size.w > size.h {
+        Orientation::Vertical
+    } else {
+        Orientation::Horizontal
+    }
+}
+
+/// The number of columns of a grid of `tiles`, `ceil(sqrt(tiles))`.
+fn grid_columns(tiles: usize) -> usize {
+    let root = tiles.isqrt();
+    if root * root < tiles { root + 1 } else { root }
+}
 
 fn swap_factor(size: Size<i32, Logical>) -> f64 {
     let target_w = std::cmp::min(size.w, MAX_SWAP_WINDOW_SIZE.0);
@@ -5954,5 +6119,224 @@ fn scale_to_center<C>(
             )
                 .into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LANDSCAPE: (i32, i32) = (1200, 600);
+    const PORTRAIT: (i32, i32) = (600, 1200);
+
+    /// A tiling tree built one window at a time, with placeholders standing in for windows.
+    struct Placed {
+        tree: Tree<Data>,
+        windows: Vec<NodeId>,
+        area: Rectangle<i32, Local>,
+    }
+
+    impl Placed {
+        fn new(size: (i32, i32)) -> Self {
+            Placed {
+                tree: Tree::new(),
+                windows: Vec::new(),
+                area: Rectangle::from_size(size.into()),
+            }
+        }
+
+        /// Places a window as `placement` does, next to window `focused` if given.
+        fn place(&mut self, placement: TilingPlacement, focused: Option<usize>) -> &mut Self {
+            let node = Node::new(Data::Placeholder {
+                id: Id::new(),
+                last_geometry: Rectangle::from_size((100, 100).into()),
+                type_: PlaceholderType::DropZone,
+            });
+            let focused = focused.map(|idx| self.windows[idx].clone());
+            let major = split_orientation(self.area.size);
+            let id = match placement {
+                TilingPlacement::Even => {
+                    TilingLayout::place_even(&mut self.tree, node, focused.as_ref(), major)
+                }
+                TilingPlacement::Grid => TilingLayout::place_grid(&mut self.tree, node, major),
+                TilingPlacement::Dwindle => unimplemented!("dwindle is placed by map_to_tree"),
+            };
+            self.windows.push(id);
+            let root_id = self.tree.root_node_id().unwrap().clone();
+            self.layout(&root_id, self.area);
+            self
+        }
+
+        fn place_n(&mut self, placement: TilingPlacement, n: usize) -> &mut Self {
+            for _ in 0..n {
+                self.place(placement, None);
+            }
+            self
+        }
+
+        /// Assigns geometries from the group sizes, like `update_positions` without gaps.
+        fn layout(&mut self, node_id: &NodeId, geo: Rectangle<i32, Local>) {
+            let data = self.tree.get_mut(node_id).unwrap().data_mut();
+            data.update_geometry(geo);
+            let Data::Group {
+                orientation, sizes, ..
+            } = data.clone()
+            else {
+                return;
+            };
+            let children = self
+                .tree
+                .children_ids(node_id)
+                .unwrap()
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut offset = 0;
+            for (child_id, size) in children.iter().zip(sizes) {
+                let child_geo = match orientation {
+                    Orientation::Vertical => Rectangle::new(
+                        (geo.loc.x + offset, geo.loc.y).into(),
+                        (size, geo.size.h).into(),
+                    ),
+                    Orientation::Horizontal => Rectangle::new(
+                        (geo.loc.x, geo.loc.y + offset).into(),
+                        (geo.size.w, size).into(),
+                    ),
+                };
+                offset += size;
+                self.layout(child_id, child_geo);
+            }
+        }
+
+        /// The tree as `cols(..)` and `rows(..)` of window indices in placement order.
+        fn shape(&self) -> String {
+            self.shape_of(self.tree.root_node_id().unwrap())
+        }
+
+        fn shape_of(&self, node_id: &NodeId) -> String {
+            match self.tree.get(node_id).unwrap().data() {
+                Data::Group { orientation, .. } => {
+                    let children = self
+                        .tree
+                        .children_ids(node_id)
+                        .unwrap()
+                        .map(|child_id| self.shape_of(child_id))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match orientation {
+                        Orientation::Vertical => format!("cols({children})"),
+                        Orientation::Horizontal => format!("rows({children})"),
+                    }
+                }
+                _ => self
+                    .windows
+                    .iter()
+                    .position(|id| id == node_id)
+                    .unwrap()
+                    .to_string(),
+            }
+        }
+
+        fn sizes(&self, idx: usize) -> (i32, i32) {
+            let size = self
+                .tree
+                .get(&self.windows[idx])
+                .unwrap()
+                .data()
+                .geometry()
+                .size;
+            (size.w, size.h)
+        }
+    }
+
+    #[test]
+    fn grid_columns_is_ceil_sqrt() {
+        let columns = (1..=10).map(grid_columns).collect::<Vec<_>>();
+        assert_eq!(columns, [1, 2, 2, 2, 3, 3, 3, 3, 3, 4]);
+    }
+
+    #[test]
+    fn grid_fills_columns_evenly() {
+        let mut placed = Placed::new(LANDSCAPE);
+        let shapes = (0..7)
+            .map(|_| placed.place(TilingPlacement::Grid, None).shape())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shapes,
+            [
+                "0",
+                "cols(0, 1)",
+                "cols(0, rows(1, 2))",
+                "cols(rows(0, 3), rows(1, 2))",
+                "cols(rows(0, 3), rows(1, 2), 4)",
+                "cols(rows(0, 3), rows(1, 2), rows(4, 5))",
+                "cols(rows(0, 3), rows(1, 2), rows(4, 5, 6))",
+            ]
+        );
+    }
+
+    #[test]
+    fn grid_gives_four_windows_a_quarter_each() {
+        let mut placed = Placed::new(LANDSCAPE);
+        placed.place_n(TilingPlacement::Grid, 4);
+        for idx in 0..4 {
+            assert_eq!(placed.sizes(idx), (600, 300));
+        }
+    }
+
+    #[test]
+    fn grid_uses_rows_on_portrait_outputs() {
+        let mut placed = Placed::new(PORTRAIT);
+        placed.place_n(TilingPlacement::Grid, 3);
+        assert_eq!(placed.shape(), "rows(0, cols(1, 2))");
+    }
+
+    #[test]
+    fn grid_treats_a_root_split_the_other_way_as_one_column() {
+        let mut placed = Placed::new(PORTRAIT);
+        placed.place_n(TilingPlacement::Even, 2);
+        placed.area = Rectangle::from_size(LANDSCAPE.into());
+        placed.place(TilingPlacement::Grid, None);
+        assert_eq!(placed.shape(), "cols(rows(0, 1), 2)");
+    }
+
+    #[test]
+    fn even_shares_the_root_without_focus() {
+        let mut placed = Placed::new(LANDSCAPE);
+        placed.place_n(TilingPlacement::Even, 3);
+        assert_eq!(placed.shape(), "cols(0, 1, 2)");
+        for idx in 0..3 {
+            assert_eq!(placed.sizes(idx), (400, 600));
+        }
+    }
+
+    #[test]
+    fn even_places_after_the_focused_window() {
+        let mut placed = Placed::new(LANDSCAPE);
+        placed
+            .place_n(TilingPlacement::Even, 3)
+            .place(TilingPlacement::Even, Some(0));
+        assert_eq!(placed.shape(), "cols(0, 3, 1, 2)");
+        for idx in 0..4 {
+            assert_eq!(placed.sizes(idx), (300, 600));
+        }
+    }
+
+    #[test]
+    fn even_stays_in_the_focused_window_group() {
+        let mut placed = Placed::new(LANDSCAPE);
+        placed
+            .place_n(TilingPlacement::Grid, 3)
+            .place(TilingPlacement::Even, Some(2));
+        assert_eq!(placed.shape(), "cols(0, rows(1, 2, 3))");
+        for idx in 1..4 {
+            assert_eq!(placed.sizes(idx), (600, 200));
+        }
+    }
+
+    #[test]
+    fn even_splits_a_lone_window_along_its_longer_side() {
+        let mut placed = Placed::new(PORTRAIT);
+        placed.place_n(TilingPlacement::Even, 2);
+        assert_eq!(placed.shape(), "rows(0, 1)");
     }
 }
